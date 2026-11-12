@@ -1,27 +1,75 @@
-"""Bốn provider cùng một interface. Không chứa agent loop."""
+"""Các provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import random
+import threading
+import time
 import urllib.error
 import urllib.request
+import uuid
 
 CONFIG = {
     'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
     'gemini': ('GEMINI_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'),
     'openrouter': ('OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1/chat/completions'),
+    'opencode-go': ('OPENCODE_GO_API_KEY', 'https://opencode.ai/inference/go/openai/v1/chat/completions'),
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
 }
 
 
+# Một bộ giới hạn chung cho Agent và Judge trong cùng tiến trình.
+_RATE_LOCK = threading.Lock()
+_LAST_REQUEST = 0.0
+
+
+def _wait_for_slot():
+    global _LAST_REQUEST
+    interval = float(os.getenv('API_REQUEST_INTERVAL', '10'))
+    with _RATE_LOCK:
+        remaining = max(0.0, _LAST_REQUEST + interval - time.monotonic())
+        if remaining:
+            print(f'Rate limiter: đợi {remaining:.1f}s...', flush=True)
+            time.sleep(remaining)
+        _LAST_REQUEST = time.monotonic()
+
+
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        _wait_for_slot()
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json', **headers}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            code = 'unknown'
+            try:
+                body = json.loads(exc.read().decode('utf-8'))
+                error = body.get('error', {})
+                if isinstance(error, dict):
+                    code = error.get('code') or error.get('type') or 'unknown'
+            except (ValueError, UnicodeError, TypeError, AttributeError):
+                pass
+            if exc.code == 429 and code == 'insufficient_quota':
+                raise RuntimeError('HTTP 429 insufficient_quota: hết quota/credit; dừng chạy.') from exc
+            if exc.code not in (429, 500, 502, 503, 504):
+                raise RuntimeError(f'Provider HTTP {exc.code} ({code})') from exc
+            if attempt == max_attempts - 1:
+                raise RuntimeError(f'Provider HTTP {exc.code} ({code}) sau {max_attempts} lần thử') from exc
+            delay = min(60.0, 5.0 * (2 ** attempt) + random.uniform(0, 1))
+            retry_after = exc.headers.get('Retry-After')
+            if retry_after:
+                try:
+                    delay = max(delay, min(120.0, float(retry_after)))
+                except ValueError:
+                    pass
+            print(f'HTTP {exc.code} ({code}); chờ {delay:.1f}s rồi thử lại...', flush=True)
+            time.sleep(delay)
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
@@ -36,6 +84,8 @@ class Provider:
         if not model:
             raise ValueError('Cần đặt MODEL là model có hỗ trợ tool calling.')
         self.name, self.model = name, model
+        # One Provider instance represents one conversation/run.
+        self.session_id = str(uuid.uuid4()) if name == 'opencode-go' else None
         key_name, self.url = CONFIG[name]
         self.key = os.getenv(key_name)
         if not self.key:
@@ -47,7 +97,10 @@ class Provider:
         payload = {'model': self.model, 'messages': messages}
         if schemas:
             payload['tools'] = schemas
-        data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
+        headers = {'Authorization': f'Bearer {self.key}'}
+        if self.name == 'opencode-go':
+            headers.update({'User-Agent': 'StatusAgentLab/1.0', 'x-opencode-session': self.session_id})
+        data = post_json(self.url, headers, payload)
         choice = data['choices'][0]
         message = choice['message']
         calls = [{'id': c['id'], 'name': c['function']['name'], 'arguments': c['function']['arguments']} for c in message.get('tool_calls', [])]
