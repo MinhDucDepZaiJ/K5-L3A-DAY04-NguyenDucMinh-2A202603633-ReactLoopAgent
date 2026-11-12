@@ -1,3 +1,8 @@
+# Ghi chú phân tích · Day 04
+
+Họ và tên: Nguyễn Đức Minh
+MSSV: 2A202603633
+
 ## 1. Case được chọn
 
 - **ID case:** H7
